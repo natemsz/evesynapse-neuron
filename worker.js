@@ -58,7 +58,7 @@ export default {
       // Misconfigured worker: dark, like everything else here.
       return notFound();
     }
-    const auth = authResult(request, secret);
+  const auth = await authResult(request, secret);
     if (auth === "missing") return notFound();
     if (auth === "wrong") return forbidden();
     try {
