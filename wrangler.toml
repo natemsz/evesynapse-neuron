@@ -16,7 +16,7 @@
 # like a new peer — no operator action besides checking the alias
 # changed.
 
-name = "evesynapse-seed"
+name = "evesynapse-neuron"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
