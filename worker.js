@@ -16,10 +16,14 @@
  * seeds as you like; none is special.
  *
  * Every member tuple is {instance_id, base_url, public_key,
- * url_sig}, where url_sig is the member's own Ed25519 signature
- * over "member\n" + instance_id + "\n" + base_url. The seed
- * signs its own tuple and stores and serves everyone else's
- * verbatim: it never signs an address for anyone but itself.
+ * url_sig, issued_at}, where url_sig is the member's own Ed25519
+ * signature over
+ *   "member\n" + instance_id + "\n" + base_url + "\n" + issued_at
+ * and issued_at is the member's unix clock when it signed. The
+ * seed signs its own tuple and stores and serves everyone else's
+ * verbatim: it never signs an address for anyone but itself. Per
+ * member it keeps the newest tuple: an older one, however valid,
+ * never replaces it, so a stale address cannot be replayed.
  *
  * The worker holds no Eve data and cannot read any: it is a
  * bulletin board for self-signed peer records. Instances verify
@@ -34,7 +38,7 @@
  *
  * Storage is one KV namespace (SEED_PEERS):
  *   "seed-identity" -> {id, publicJwk, privateJwk} (minted once)
- *   "peer:<instance_id>" -> {base_url, public_key, url_sig, last_seen}
+ *   "peer:<instance_id>" -> {base_url, public_key, url_sig, issued_at, last_seen}
  *     with a 48h TTL, refreshed by each heartbeat.
  *
  * Secrets (wrangler secret put):
@@ -137,14 +141,22 @@ async function authResult(request, secret) {
 async function handleMembers(env, secret, origin) {
   const identity = await seedIdentity(env);
   const peers = await listPeers(env);
+  const issuedAt = Math.floor(Date.now() / 1000);
   const members = [
     {
       instance_id: identity.id,
       base_url: origin,
       public_key: identity.publicB64,
-      url_sig: await signMember(identity, origin),
+      url_sig: await signMember(identity, origin, issuedAt),
+      issued_at: issuedAt,
     },
-    ...peers.map((p) => ({ instance_id: p.id, base_url: p.base_url, public_key: p.public_key, url_sig: p.url_sig })),
+    ...peers.map((p) => ({
+      instance_id: p.id,
+      base_url: p.base_url,
+      public_key: p.public_key,
+      url_sig: p.url_sig,
+      issued_at: p.issued_at,
+    })),
   ];
   const sealed = await sealMembers(JSON.stringify(members), secret);
   const entry = await signEntry(
@@ -166,12 +178,13 @@ async function listPeers(env) {
     if (!rec || typeof rec.base_url !== "string" || typeof rec.public_key !== "string") continue;
     // A record from before addresses were signed has nothing to
     // relay; it ages out, or its owner's next heartbeat replaces it.
-    if (typeof rec.url_sig !== "string" || rec.url_sig === "") continue;
+    if (typeof rec.url_sig !== "string" || rec.url_sig === "" || !Number.isInteger(rec.issued_at)) continue;
     out.push({
       id: key.name.slice("peer:".length),
       base_url: rec.base_url,
       public_key: rec.public_key,
       url_sig: rec.url_sig,
+      issued_at: rec.issued_at,
       last_seen: rec.last_seen || 0,
     });
   }
@@ -200,7 +213,8 @@ async function handleRegister(env, request) {
     !detail ||
     typeof detail.base_url !== "string" ||
     typeof detail.public_key !== "string" ||
-    typeof detail.url_sig !== "string"
+    typeof detail.url_sig !== "string" ||
+    !Number.isInteger(detail.issued_at)
   ) {
     return new Response("bad request", { status: 400 });
   }
@@ -213,9 +227,9 @@ async function handleRegister(env, request) {
     return new Response("bad request", { status: 400 });
   }
   // And the member tuple itself: the sender's signature over its
-  // ID and address, under the same key. This is what gets stored
+  // ID, address and issue time, under the same key. This is what gets stored
   // and relayed, so it is checked before it is kept.
-  if (!(await verifyMember(entry.signer, detail.base_url, detail.public_key, detail.url_sig))) {
+  if (!(await verifyMember(entry.signer, detail.base_url, detail.public_key, detail.url_sig, detail.issued_at))) {
     return new Response("bad request", { status: 400 });
   }
   const identity = await seedIdentity(env);
@@ -229,6 +243,12 @@ async function handleRegister(env, request) {
   if (!exists && stored.keys.filter((k) => k.name.startsWith("peer:")).length >= MAX_STORED_PEERS) {
     return new Response("busy", { status: 429 });
   }
+  let tuple = {
+    base_url: detail.base_url,
+    public_key: detail.public_key,
+    url_sig: detail.url_sig,
+    issued_at: detail.issued_at,
+  };
   if (exists) {
     // First key wins for an instance ID while its record lives:
     // a heartbeat under another key is a conflict, not a rotation.
@@ -236,15 +256,27 @@ async function handleRegister(env, request) {
     if (prior && typeof prior.public_key === "string" && prior.public_key !== detail.public_key) {
       return new Response("conflict", { status: 409 });
     }
+    // Newest tuple wins: one issued no later than the tuple held
+    // refreshes the listing but does not replace the tuple, so a
+    // replayed old heartbeat cannot move an address back.
+    if (
+      prior &&
+      typeof prior.url_sig === "string" &&
+      prior.url_sig !== "" &&
+      Number.isInteger(prior.issued_at) &&
+      prior.issued_at >= detail.issued_at
+    ) {
+      tuple = {
+        base_url: prior.base_url,
+        public_key: prior.public_key,
+        url_sig: prior.url_sig,
+        issued_at: prior.issued_at,
+      };
+    }
   }
   await env.SEED_PEERS.put(
     peerKey,
-    JSON.stringify({
-      base_url: detail.base_url,
-      public_key: detail.public_key,
-      url_sig: detail.url_sig,
-      last_seen: Math.floor(Date.now() / 1000),
-    }),
+    JSON.stringify({ ...tuple, last_seen: Math.floor(Date.now() / 1000) }),
     { expirationTtl: PEER_TTL_SECONDS }
   );
   return json({ ok: true });
@@ -350,28 +382,29 @@ function mintInstanceId() {
 /* --- member tuples ------------------------------------------------ */
 
 // What a member signs to own its address:
-//   "member\n" + instance_id + "\n" + base_url
+//   "member\n" + instance_id + "\n" + base_url + "\n" + issued_at
+// issued_at is the unix time of signing, in decimal.
 // Byte-for-byte the Go side's swarmMemberMessage; the vector is
 // pinned by TestSwarmMemberMessageVector in the main repository.
-function memberMessage(instanceId, baseUrl) {
-  return textEncoder.encode("member\n" + instanceId + "\n" + baseUrl);
+function memberMessage(instanceId, baseUrl, issuedAt) {
+  return textEncoder.encode("member\n" + instanceId + "\n" + baseUrl + "\n" + String(issuedAt));
 }
 
-async function signMember(identity, baseUrl) {
+async function signMember(identity, baseUrl, issuedAt) {
   const sig = new Uint8Array(
-    await crypto.subtle.sign({ name: "Ed25519" }, identity.privateKey, memberMessage(identity.id, baseUrl))
+    await crypto.subtle.sign({ name: "Ed25519" }, identity.privateKey, memberMessage(identity.id, baseUrl, issuedAt))
   );
   return b64encode(sig);
 }
 
-async function verifyMember(instanceId, baseUrl, publicB64, sigB64) {
+async function verifyMember(instanceId, baseUrl, publicB64, sigB64, issuedAt) {
   try {
     const raw = b64decode(publicB64);
     if (raw.byteLength !== 32) return false;
     const sig = b64decode(sigB64);
     if (sig.byteLength !== 64) return false;
     const key = await crypto.subtle.importKey("raw", raw, { name: "Ed25519" }, false, ["verify"]);
-    return await crypto.subtle.verify({ name: "Ed25519" }, key, sig, memberMessage(instanceId, baseUrl));
+    return await crypto.subtle.verify({ name: "Ed25519" }, key, sig, memberMessage(instanceId, baseUrl, issuedAt));
   } catch {
     return false;
   }

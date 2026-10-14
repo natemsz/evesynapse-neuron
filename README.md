@@ -9,9 +9,10 @@ Ed25519-signed entries, byte-compatible with `swarm_api.go`:
 - `GET /swarm/members` → `{"entry": ...}`: the worker plus every
   registered peer, sealed under the shared secret, signed by the
   worker's own KV-persisted identity (pinned on first use). Each
-  member is a tuple `{instance_id, base_url, public_key, url_sig}`;
-  `url_sig` is that member's own Ed25519 signature over
-  `"member\n" + instance_id + "\n" + base_url`. The worker signs
+  member is a tuple `{instance_id, base_url, public_key, url_sig,
+  issued_at}`; `url_sig` is that member's own Ed25519 signature over
+  `"member\n" + instance_id + "\n" + base_url + "\n" + issued_at`,
+  and `issued_at` is its unix clock when it signed. The worker signs
   its own tuple and relays every other one exactly as it was
   registered.
 - `POST /swarm/pull` → `{"entries": []}`: the seed holds no Eve
@@ -19,11 +20,13 @@ Ed25519-signed entries, byte-compatible with `swarm_api.go`:
 - `POST /swarm/seed/register` → `{"ok": true}`: heartbeat carrying
   the instance's self-signed announce entry (`kind: "announce"`,
   `key`/`signer` = instance id, payload = its base URL, public
-  key and `url_sig`). The worker verifies the envelope and the
+  key, `url_sig` and `issued_at`). The worker verifies the envelope and the
   address signature against the claimed key (same
   trust-on-first-use as mesh gossip), requires an `https:` base
   URL, and stores the tuple with a 48h TTL. While a record
-  lives, a heartbeat for its ID under another key answers 409. Instances
+  lives, a heartbeat for its ID under another key answers 409,
+  and a tuple issued no later than the one held refreshes the
+  listing without replacing it (no replay of an old address). Instances
   re-announce every gossip round (12–24h), so dead peers age out
   on their own. At most 1000 peers stored, 500 served, newest
   heartbeats first.
@@ -72,8 +75,8 @@ setups; they do not share anything.
 
 A worker that minted its identity while every seed shared the ID
 `seed` keeps its keypair and gives itself a fresh ID the first time
-it runs this version. Instances then see a new member; the old
-`seed` row on each instance can be removed on its Admin page.
+it runs this version. Instances then see a new member; the upgraded
+instance removes its old `seed` row by itself.
 
 ## Rolling out a format change
 
