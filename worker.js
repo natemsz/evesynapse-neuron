@@ -55,9 +55,6 @@ const PEER_TTL_SECONDS = 48 * 3600;
 const MAX_STORED_PEERS = 1000;
 const MAX_SERVED_PEERS = 500;
 const MAX_BODY_BYTES = 1 << 20;
-// The ID every seed worker used to share. Kept only to recognise
-// an identity minted under it and give it an ID of its own.
-const LEGACY_SEED_ID = "seed";
 
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
@@ -240,6 +237,19 @@ async function handleRegister(env, request) {
   const stored = await env.SEED_PEERS.list({ limit: MAX_STORED_PEERS });
   const peerKey = "peer:" + entry.signer;
   const exists = stored.keys.some((k) => k.name === peerKey);
+  // A new listing is filed only under the ID its key certifies,
+  // so nobody can list as an instance it is not.
+  if (!exists) {
+    let certified = false;
+    try {
+      certified = entry.signer === (await instanceIdForKey(b64decode(detail.public_key)));
+    } catch {
+      certified = false;
+    }
+    if (!certified) {
+      return new Response("bad request", { status: 400 });
+    }
+  }
   if (!exists && stored.keys.filter((k) => k.name.startsWith("peer:")).length >= MAX_STORED_PEERS) {
     return new Response("busy", { status: 429 });
   }
@@ -339,15 +349,16 @@ function concatBytes(chunks) {
 
 /* --- identity ---------------------------------------------------- */
 
-// This seed's identity: an instance ID and an Ed25519 keypair of
-// its own, minted on first use and kept in KV, like any member's.
-// A seed is a role, not one identity: every seed worker has a
-// different ID and key, and instances pin each on first sight.
+// This seed's identity: an Ed25519 keypair of its own, minted on
+// first use and kept in KV, and the instance ID the key certifies,
+// like any member's. A seed is a role, not one identity: every seed
+// worker has a different ID and key, and instances pin each on
+// first sight.
 //
-// A record minted before seeds had their own IDs carries the old
-// shared ID "seed". It keeps its keypair and is given a fresh
-// ID once, so instances see a new member rather than a changed
-// key on an old one.
+// A record minted under an older ID (a random one, or the shared
+// "seed" every worker once used) keeps its keypair and takes the
+// derived ID once, so instances see a new member rather than a
+// changed key on an old one.
 async function seedIdentity(env) {
   const stored = await env.SEED_PEERS.get("seed-identity", { type: "json" });
   if (stored && stored.publicJwk && stored.privateJwk) {
@@ -355,8 +366,12 @@ async function seedIdentity(env) {
       crypto.subtle.importKey("jwk", stored.publicJwk, { name: "Ed25519" }, true, ["verify"]),
       crypto.subtle.importKey("jwk", stored.privateJwk, { name: "Ed25519" }, true, ["sign"]),
     ]);
-    if (typeof stored.id !== "string" || stored.id === "" || stored.id === LEGACY_SEED_ID) {
-      stored.id = mintInstanceId();
+    // The ID is the one the key certifies; a record minted
+    // before that (a random ID, or the old shared "seed") keeps
+    // its keypair and takes the derived ID once.
+    const derived = await instanceIdForKey(new Uint8Array(await crypto.subtle.exportKey("raw", publicKey)));
+    if (stored.id !== derived) {
+      stored.id = derived;
       await env.SEED_PEERS.put("seed-identity", JSON.stringify(stored));
     }
     return { ...stored, publicKey, privateKey };
@@ -367,16 +382,18 @@ async function seedIdentity(env) {
     crypto.subtle.exportKey("jwk", pair.privateKey),
   ]);
   const raw = new Uint8Array(await crypto.subtle.exportKey("raw", pair.publicKey));
-  const rec = { id: mintInstanceId(), publicJwk, privateJwk, publicB64: b64encode(raw) };
+  const rec = { id: await instanceIdForKey(raw), publicJwk, privateJwk, publicB64: b64encode(raw) };
   await env.SEED_PEERS.put("seed-identity", JSON.stringify(rec));
   return { ...rec, publicKey: pair.publicKey, privateKey: pair.privateKey };
 }
 
-// mintInstanceId draws an instance ID the way the instances do:
-// 16 random bytes, URL-safe base64 without padding.
-function mintInstanceId() {
-  const raw = crypto.getRandomValues(new Uint8Array(16));
-  return b64encode(raw).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+// instanceIdForKey is the instance ID a raw Ed25519 public key
+// certifies, the instances' rule: the first 16 bytes of its
+// SHA-256, URL-safe base64 without padding. Nobody holding another
+// key can claim it.
+async function instanceIdForKey(rawKey) {
+  const sum = new Uint8Array(await crypto.subtle.digest("SHA-256", rawKey));
+  return b64encode(sum.slice(0, 16)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
 /* --- member tuples ------------------------------------------------ */
