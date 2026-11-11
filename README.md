@@ -23,7 +23,10 @@ Ed25519-signed entries, byte-compatible with `swarm_api.go`:
   key, `url_sig` and `issued_at`). The worker verifies the envelope and the
   address signature against the claimed key (same
   trust-on-first-use as mesh gossip), requires an `https:` base
-  URL, and stores the tuple with a 48h TTL. While a record
+  URL, and stores the tuple with a 48h TTL. A new listing must use
+  the instance ID its key certifies (the first 16 bytes of the
+  key's SHA-256, URL-safe base64), so nobody can list as another
+  instance; anything else answers 400. While a record
   lives, a heartbeat for its ID under another key answers 409,
   and a tuple issued no later than the one held refreshes the
   listing without replacing it (no replay of an old address). Instances
@@ -68,9 +71,10 @@ goes red.
 ## Identity
 
 A seed is a role, not one identity. Each worker mints its own
-instance ID and Ed25519 keypair on first use and keeps them in KV
-(`seed-identity`), and instances pin it on first sight like any
-member. Run more than one seed if you want backups or separate
+Ed25519 keypair on first use, keeps it in KV (`seed-identity`), and
+goes by the instance ID the key certifies; a record kept under an
+older ID takes the derived one on first use. Instances pin it on
+first sight like any member. Run more than one seed if you want backups or separate
 setups; they do not share anything.
 
 A worker that minted its identity while every seed shared the ID
